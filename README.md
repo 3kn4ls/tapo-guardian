@@ -186,3 +186,66 @@ errores de configuración al momento en vez de tener que ir al log.
 - No compartas `.env`.
 - No abras hacia Internet ni el puerto RTSP 554 ni el ONVIF 2020. Ambos van sin cifrar.
 - Usa una cuenta de cámara específica para RTSP en vez de reutilizar la contraseña de tu TP-Link ID.
+
+## 8. Despliegue en Kubernetes (k3s)
+
+El servicio corre 24/7 en el cluster k3s del Raspberry Pi 5, en el namespace
+`tapo-guardian`. La imagen se publica en `ghcr.io/3kn4ls/tapo-guardian` desde GitHub
+Actions, solo para `linux/arm64`.
+
+### Configuración
+
+`k8s/configmap.yaml` lleva lo que no es secreto (`TAPO_IP`, `WATCH_EVENTS`,
+`MOTION_COOLDOWN`, `TZ`…). Los secretos **no están en git**: se crean una vez a mano.
+
+```bash
+kubectl create namespace tapo-guardian
+
+kubectl -n tapo-guardian create secret generic tapo-guardian-secret \
+  --from-literal=TAPO_USER='<usuario cuenta de cámara>' \
+  --from-literal=TAPO_PASSWORD='<password>' \
+  --from-literal=TELEGRAM_BOT_TOKEN='<token>' \
+  --from-literal=TELEGRAM_CHAT_ID='<chat_id[,chat_id2]>'
+
+kubectl -n tapo-guardian create secret docker-registry ghcr-auth \
+  --docker-server=ghcr.io --docker-username=<usuario> --docker-password="$(gh auth token)"
+```
+
+`k8s/secret.yaml.example` es la plantilla; `k8s/.gitignore` impide commitear el real.
+
+### Desplegar
+
+```bash
+kubectl apply -f k8s/
+```
+
+Para publicar una versión nueva —`release.sh` sube `VERSION`, actualiza el tag de la
+imagen en `k8s/deployment.yaml`, y hace commit, tag y push:
+
+```bash
+./release.sh patch "descripción del cambio"
+```
+
+Nunca se usa `:latest`: k3s no vuelve a descargar un tag que no ha cambiado.
+
+### Detalles que no son evidentes
+
+- **`replicas: 1` y `strategy: Recreate` son obligatorios.** Dos pods a la vez abren dos
+  suscripciones ONVIF y cada evento llega duplicado a Telegram.
+- **`/health`** solo se activa si `HEALTH_PORT` está definido, así que el uso local en
+  Windows no cambia. La liveness probe cubre el caso que el backoff interno no puede:
+  proceso vivo pero clavado en un socket. Umbral de 150s sobre un poll de 30s.
+- **La cámara sirve pocas sesiones RTSP simultáneas.** Si lanzas capturas manuales
+  mientras el pod corre, puedes provocarle un `Operation not permitted`. Reintenta una vez.
+- **El rootfs va en solo lectura**; el JPG se escribe en un `emptyDir` montado en `/tmp`.
+
+### Comprobar que funciona
+
+```bash
+kubectl -n tapo-guardian get pods
+kubectl -n tapo-guardian logs -f deploy/tapo-guardian
+```
+
+Al arrancar debe aparecer `Suscripción ONVIF activa.`, y al pasar por delante de la
+cámara `✅ Movimiento enviado a <chat_id>`. La hora del pie de foto debe ser la local:
+si sale en UTC, falta `TZ` o `tzdata`.

@@ -77,7 +77,15 @@ son sutiles:
 - **`log()` usa `flush=True`**: el Programador de tareas de Windows redirige a
   fichero y un log con buffer no sirve para diagnosticar por qué enmudeció el watcher.
 - **`MOTION_COOLDOWN`** existe por el límite de Telegram (~20 mensajes/minuto a un
-  grupo). No lo bajes a la ligera.
+  grupo). No lo bajes a la ligera. Es global a todos los detectores, no por detector.
+- **Nada de credenciales en los logs.** No basta con no imprimir `rtsp_url`: ffmpeg
+  devuelve la URL entera en su stderr, así que ese texto pasa por `redact_rtsp()`
+  antes de acabar en un mensaje de error. En Kubernetes eso va directo a `kubectl logs`.
+- **SIGTERM se traduce a `KeyboardInterrupt`** (`install_sigterm_handler`). Python no
+  instala handler, así que como PID 1 el proceso moría sin ejecutar el `finally` que
+  hace `unsubscribe()`: cada rollout gastaba los 30s enteros de grace period.
+- **El snapshot se reintenta una vez.** La cámara sirve pocas sesiones RTSP simultáneas
+  y rechaza alguna en caliente; sin reintento se pierde la foto de ese evento.
 
 ## Configuración
 
@@ -95,9 +103,28 @@ docstrings de módulo y función están **en inglés**. Mantén esa convención.
 
 ## Despliegue
 
-Objetivo real: Windows, mediante una tarea del Programador con `pythonw.exe` y
-redirección de stdout a `watch.log` (ver README §7). Cualquier cambio en el arranque
-o en el logging debe seguir funcionando sin consola conectada.
+Dos destinos, y los dos deben seguir funcionando:
+
+- **k3s** (el principal): `tapo_watch.py` corre 24/7 en el namespace `tapo-guardian`.
+  Imagen en `ghcr.io/3kn4ls/tapo-guardian`, manifiestos en `k8s/`, publicación con
+  `./release.sh patch "..."`. Ver README §8.
+- **Windows**: tarea del Programador con `pythonw.exe` (README §7). Cualquier cambio
+  en el arranque o el logging debe seguir funcionando sin consola conectada.
+
+Invariantes del Deployment:
+
+- **`replicas: 1` + `strategy: Recreate`**. Dos pods solapados = dos suscripciones
+  ONVIF = fotos duplicadas. No escalar nunca.
+- **`/health` solo con `HEALTH_PORT` definido**, para que el uso local no abra puertos.
+  Umbral de 150s, holgado sobre el poll de 30s y el backoff máximo de 60s.
+- **La config va por env, no por `.env`.** La imagen no lleva `.env` y `load_env_file`
+  es un no-op si no existe: en el cluster todo llega de ConfigMap y Secret.
+- **Los secretos no están en git.** Se crean con `kubectl create secret`; en el repo
+  solo `k8s/secret.yaml.example`. ArgoCD no los gestiona y `prune` no los toca.
+- ArgoCD **está escalado a 0 en este cluster** (todos sus Deployments, no solo el
+  image-updater). Mientras siga así, los cambios se aplican con `kubectl apply -f k8s/`.
+  El `Application` existe en `/home/ecanals/ws/argocd/tapo-guardian.yaml` para cuando
+  se levante. Ojo: al levantarlo, `selfHeal` revertirá ediciones manuales del ConfigMap.
 
 ## Seguridad
 
