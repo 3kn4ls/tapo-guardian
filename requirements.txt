@@ -1,0 +1,1 @@
+# No dependencies: the script uses Python standard library + ffmpeg executable.
