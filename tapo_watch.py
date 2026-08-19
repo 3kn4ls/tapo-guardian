@@ -163,11 +163,20 @@ def dispatch(
     """
     label = LABELS.get(event.name, event.name)
     caption = f"🚨 {label} — {datetime.now():%H:%M:%S}"
-    try:
-        run_ffmpeg(rtsp_url, output)
-    except RuntimeError as exc:
-        log(f"❌ no se pudo capturar el snapshot: {exc}")
-        return
+    # The camera serves a limited number of concurrent RTSP sessions and briefly
+    # refuses new ones while another is being torn down, which showed up in
+    # production as a lone "Operation not permitted" on an otherwise healthy
+    # camera. One retry turns that dropped event into a delivered photo.
+    for attempt in (1, 2):
+        try:
+            run_ffmpeg(rtsp_url, output)
+            break
+        except RuntimeError as exc:
+            if attempt == 2:
+                log(f"❌ no se pudo capturar el snapshot: {exc}")
+                return
+            log(f"⚠ snapshot fallido, reintentando: {exc}")
+            time.sleep(2)
     for chat_id in chat_ids:
         try:
             send_photo(token, chat_id, output, caption)

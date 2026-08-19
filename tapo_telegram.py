@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,11 @@ def parse_chat_ids(raw: str) -> list[str]:
     return unique
 
 
+def redact_rtsp(text: str) -> str:
+    """Strip credentials out of any rtsp:// URL appearing in text."""
+    return re.sub(r"(rtsp://)[^@/\s]*@", r"\1***:***@", text)
+
+
 def build_rtsp_url() -> str:
     host = require_env("TAPO_IP")
     user = quote(require_env("TAPO_USER"), safe="")
@@ -117,7 +123,10 @@ def run_ffmpeg(rtsp_url: str, output: Path) -> None:
         raise RuntimeError("Timeout conectando con la cámara por RTSP.") from exc
 
     if result.returncode != 0 or not output.exists() or output.stat().st_size == 0:
-        details = (result.stderr or "").strip()
+        # ffmpeg echoes the input URL back in its errors, password included, and in
+        # Kubernetes that lands straight in `kubectl logs`. Keeping rtsp_url out of
+        # our own prints is not enough: the credentials have to be scrubbed here.
+        details = redact_rtsp(result.stderr or "").strip()
         raise RuntimeError(
             "No se pudo obtener el snapshot por RTSP. "
             + (f"ffmpeg: {details}" if details else "Revisa IP, usuario, contraseña y RTSP.")
