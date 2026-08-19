@@ -32,7 +32,7 @@ spec:
         runAsGroup: 999
       containers:
         - name: tapo-guardian
-          image: ghcr.io/3kn4ls/tapo-guardian:v1.0.0
+          image: ghcr.io/3kn4ls/tapo-guardian:v1.0.1
           imagePullPolicy: Always
           args:
             - --output
