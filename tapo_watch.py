@@ -9,13 +9,18 @@ Examples:
   python tapo_watch.py
   python tapo_watch.py --once
   python tapo_watch.py --debug
+
+Con HEALTH_PORT definido expone GET /health para la liveness probe de Kubernetes.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import signal
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from onvif_events import Event, OnvifError, PullPointSession
@@ -34,6 +39,9 @@ POLL_SECONDS = 30
 # Subscriptions are created with a 10 minute lifetime; renew well before that.
 RENEW_EVERY = 300
 MAX_BACKOFF = 60
+# Liveness threshold. A healthy loop touches the beat every POLL_SECONDS, and a
+# reconnect costs at most MAX_BACKOFF, so 150s clears both without false alarms.
+STALE_AFTER = 150
 
 LABELS = {
     "Motion": "Movimiento",
@@ -49,6 +57,74 @@ def log(message: str) -> None:
     # flush: Task Scheduler redirects this to a file, and buffered logs are useless
     # when you are trying to work out why the watcher went quiet.
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
+
+
+class Heartbeat:
+    """Last time the watch loop made progress, shared with the health server.
+
+    The loop and the HTTP thread touch this from different threads, hence the lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._beat = time.monotonic()
+
+    def beat(self) -> None:
+        with self._lock:
+            self._beat = time.monotonic()
+
+    def age(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._beat
+
+
+def start_health_server(port: int, heartbeat: Heartbeat) -> None:
+    """Serve GET /health on a daemon thread for the Kubernetes liveness probe.
+
+    The watcher already recovers from ONVIF failures on its own, so this exists for
+    the one case that self-healing cannot reach: a loop wedged on a socket that
+    never returns, or a subscription the camera dropped silently. Both leave the
+    process alive and sending nothing, which no restartPolicy would ever catch.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            if self.path.split("?", 1)[0] != "/health":
+                self.send_error(404)
+                return
+            age = heartbeat.age()
+            alive = age < STALE_AFTER
+            body = f"{'ok' if alive else 'stale'} age={age:.0f}s\n".encode()
+            self.send_response(200 if alive else 503)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            # Silence per-request logging: the probe hits this every 30s and would
+            # otherwise bury the event lines we actually care about.
+            pass
+
+    server = ThreadingHTTPServer(("", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"Health endpoint en :{port}/health")
+
+
+def install_sigterm_handler() -> None:
+    """Make SIGTERM unwind like Ctrl-C so the subscription is released.
+
+    Python installs no SIGTERM handler, so as PID 1 in a container the default
+    action kills the process outright: the `finally: unsubscribe()` never runs,
+    the pod burns its whole termination grace period on every rollout, and the
+    camera is left holding a subscription nobody will ever pull from again.
+    Raising KeyboardInterrupt reuses the shutdown path Ctrl-C already exercises.
+    """
+
+    def handler(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, handler)
 
 
 def env_number(name: str, default: float) -> float:
@@ -109,6 +185,7 @@ def main() -> int:
     args = parser.parse_args()
 
     configure_console()
+    install_sigterm_handler()
     load_env_file(Path(__file__).with_name(".env"))
     if args.stream:
         os.environ["TAPO_STREAM"] = args.stream
@@ -133,6 +210,13 @@ def main() -> int:
     log(f"Vigilando {', '.join(sorted(watched))} en {os.getenv('TAPO_IP')}:{port}")
     log(f"Destinos: {', '.join(chat_ids)} | cooldown {cooldown:.0f}s")
 
+    # Off unless HEALTH_PORT is set, so running this on a laptop or as a Windows
+    # scheduled task behaves exactly as before and binds no port.
+    heartbeat = Heartbeat()
+    health_port = int(env_number("HEALTH_PORT", 0))
+    if health_port:
+        start_health_server(health_port, heartbeat)
+
     connected = False
     backoff = 1.0
     next_renew = 0.0
@@ -156,12 +240,18 @@ def main() -> int:
                     next_renew = time.monotonic() + RENEW_EVERY
 
                 events = session.pull()
+                # A poll that returns -- with or without events -- is the proof the
+                # loop is still alive and talking to the camera.
+                heartbeat.beat()
             except OnvifError as exc:
                 connected = False
                 session.unsubscribe()
                 log(f"⚠ {exc} — reintento en {backoff:.0f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
+                # Beat on the way out too: reconnecting is healthy work, and a camera
+                # rebooting for a couple of minutes must not trigger a pod restart.
+                heartbeat.beat()
                 continue
 
             for event in events:

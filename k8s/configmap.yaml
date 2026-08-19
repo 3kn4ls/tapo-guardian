@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tapo-guardian-config
+  namespace: tapo-guardian
+  labels:
+    app: tapo-guardian
+data:
+  # IP real de la TC71 en la LAN. Conviene reservarla por DHCP en el router:
+  # si cambia, el watcher se queda reintentando contra una IP muerta.
+  TAPO_IP: "192.168.1.111"
+
+  # 1 = stream principal (mejor calidad de snapshot); 2 = substream.
+  TAPO_STREAM: "1"
+
+  ONVIF_PORT: "2020"
+
+  # Detectores que disparan el envio. Confirmado por --debug que la camara emite
+  # tns1:RuleEngine/CellMotionDetector/Motion.
+  WATCH_EVENTS: "Motion,People"
+
+  # Segundos minimos entre envios, global a todos los detectores. Existe por el
+  # limite de Telegram (~20 mensajes/minuto a un grupo).
+  MOTION_COOLDOWN: "60"
+
+  # Sin esto los pies de foto y los logs saldrian en UTC: el caption usa un
+  # datetime.now() naive.
+  TZ: "Europe/Madrid"
+
+  # Activa el endpoint /health que consume la liveness probe.
+  HEALTH_PORT: "8080"

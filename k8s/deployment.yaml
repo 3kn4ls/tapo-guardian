@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tapo-guardian
+  namespace: tapo-guardian
+  labels:
+    app: tapo-guardian
+spec:
+  # NUNCA escalar por encima de 1: cada replica abre su propia suscripcion ONVIF,
+  # con lo que cada evento llegaria a Telegram tantas veces como replicas haya.
+  replicas: 1
+  # Recreate y no RollingUpdate por lo mismo: maxSurge levantaria un segundo pod
+  # solapado durante el rollout, duplicando las fotos mientras dura.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tapo-guardian
+  template:
+    metadata:
+      labels:
+        app: tapo-guardian
+    spec:
+      # SIGTERM se traduce a KeyboardInterrupt en tapo_watch.py, asi que el
+      # unsubscribe() corre y el pod muere en ~0.3s. Este margen es solo colchon.
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: ghcr-auth
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 999
+      containers:
+        - name: tapo-guardian
+          image: ghcr.io/3kn4ls/tapo-guardian:v1.0.0
+          imagePullPolicy: Always
+          args:
+            - --output
+            - /tmp/snapshot.jpg
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: TAPO_IP
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: TAPO_IP
+            - name: TAPO_STREAM
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: TAPO_STREAM
+            - name: ONVIF_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: ONVIF_PORT
+            - name: WATCH_EVENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: WATCH_EVENTS
+            - name: MOTION_COOLDOWN
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: MOTION_COOLDOWN
+            - name: TZ
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: TZ
+            - name: HEALTH_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: tapo-guardian-config
+                  key: HEALTH_PORT
+            - name: TAPO_USER
+              valueFrom:
+                secretKeyRef:
+                  name: tapo-guardian-secret
+                  key: TAPO_USER
+            - name: TAPO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tapo-guardian-secret
+                  key: TAPO_PASSWORD
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tapo-guardian-secret
+                  key: TELEGRAM_BOT_TOKEN
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tapo-guardian-secret
+                  key: TELEGRAM_CHAT_ID
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # Medido contra la camara real: ffmpeg pica a 78 MiB decodificando el
+              # keyframe del stream principal. Con el interprete encima, el 128Mi
+              # habitual de la casa dejaria el envio al borde del OOMKill.
+              cpu: 500m
+              memory: 256Mi
+          # Sin readinessProbe: no hay Service ni trafico entrante que gatear.
+          # La liveness cubre lo que el backoff interno no puede: proceso vivo pero
+          # clavado, o suscripcion que la camara tiro en silencio.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            # sync_clock + subscribe tardan unos segundos en el primer arranque.
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        # El JPG se sobrescribe en cada evento y no hay nada que archivar, asi que
+        # emptyDir basta y evita escribir en la capa de imagen.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

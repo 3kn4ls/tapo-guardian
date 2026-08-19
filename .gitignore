@@ -3,3 +3,5 @@ snapshot.jpg
 __pycache__/
 *.pyc
 watch.log
+*.swp
+.*.swp

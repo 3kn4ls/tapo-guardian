@@ -1,0 +1,22 @@
+# El .env real vive en este directorio: que no entre NUNCA en la imagen.
+# La config en Kubernetes llega por ConfigMap/Secret, y load_env_file() es un
+# no-op cuando el fichero no existe, asi que la imagen no lo necesita.
+.env
+*.swp
+.*.swp
+
+.git/
+.github/
+k8s/
+
+__pycache__/
+*.pyc
+
+snapshot.jpg
+*.jpg
+watch.log
+*.log
+
+CLAUDE.md
+README.md
+release.sh
